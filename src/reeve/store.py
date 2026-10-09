@@ -15,26 +15,23 @@ from __future__ import annotations
 
 import hashlib
 import json
+import random
 import re
 import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Callable, Iterable, Iterator, Sequence
 
+from . import history
+from .dice import RollOutcome, parse_dice, roll_dice
+from .errors import ChainError, HistoryRefused, ReeveError
 from .projection import Projection
 
 ROLES = ("dm", "player", "observer", "system")
 _AUDIENCE_RE = re.compile(r"^(public|party|dm|actor:[A-Za-z0-9_.\-]+)$")
 _TYPE_RE = re.compile(r"^[A-Z][A-Za-z0-9]*$")
 _ID_RE = re.compile(r"^[A-Za-z0-9_.\-:]+$")
-
-
-class ReeveError(Exception):
-    """Base class for refusals raised by the core."""
-
-
-class ChainError(ReeveError):
-    """The hash chain does not verify: the log has been altered."""
+_ROLL_KEY_RE = re.compile(r"^[A-Za-z0-9_.\-:/]+$")
 
 
 SCHEMA = """
@@ -74,6 +71,8 @@ CREATE TABLE IF NOT EXISTS events (
 );
 
 CREATE INDEX IF NOT EXISTS events_transaction ON events(transaction_id, position_in_transaction);
+CREATE INDEX IF NOT EXISTS events_roll_key ON events(campaign_id, json_extract(payload_json, '$.key'))
+    WHERE type = 'RollMade';
 
 -- The past is not editable. These are the machine that refuses.
 CREATE TRIGGER IF NOT EXISTS events_no_update BEFORE UPDATE ON events
@@ -157,9 +156,45 @@ class Transaction:
         self.arguments = arguments
         self.sequence_number: int | None = None
         self._pending_events: list[dict] = []
+        self._reused_roll_sequence_numbers: set[int] = set()
 
     def emit(self, event_type: str, payload: dict | None = None, *, audience: str = "public",
              subjects: Sequence[str] = (), world_time: int | None = None) -> None:
+        if event_type in history.RESERVED_EVENT_TYPES:
+            raise ReeveError(f"{event_type} is reserved for the core; use roll(), Store.undo() and friends")
+        self._append_event(event_type, payload, audience, subjects, world_time)
+
+    def roll(self, key: str, dice: str, *, audience: str = "public", subjects: Sequence[str] = (),
+             world_time: int | None = None) -> RollOutcome:
+        """Roll dice inside this transaction, recording a RollMade event.
+
+        ``key`` names the purpose of the roll (e.g. ``attack:dave:goblin-1:round-3``). If an earlier roll
+        with the same key and dice sits unused in an undone transaction, its result is reused instead of
+        rolling again; otherwise fresh dice are rolled. Either way the event records which.
+        """
+        if not _ROLL_KEY_RE.match(key):
+            raise ReeveError(f"bad roll key {key!r}")
+        specification = parse_dice(dice)
+        reusable = self._store._reusable_rolls(self.campaign_id, key, specification.notation,
+                                               frozenset(self._reused_roll_sequence_numbers))
+        if reusable:
+            source_sequence_number, source_payload = reusable[0]
+            self._reused_roll_sequence_numbers.add(source_sequence_number)
+            outcome = RollOutcome(
+                notation=source_payload["dice"], individual_results=tuple(source_payload["results"]),
+                modifier=source_payload["modifier"], total=source_payload["total"])
+            reused_from = source_sequence_number
+        else:
+            outcome = roll_dice(specification, self._store._random_source)
+            reused_from = None
+        self._append_event(history.ROLL_MADE_EVENT_TYPE, dict(
+            key=key, dice=outcome.notation, results=list(outcome.individual_results),
+            modifier=outcome.modifier, total=outcome.total, reused_from=reused_from),
+            audience, subjects, world_time)
+        return outcome
+
+    def _append_event(self, event_type: str, payload: dict | None, audience: str,
+                      subjects: Sequence[str], world_time: int | None) -> None:
         if not _TYPE_RE.match(event_type):
             raise ReeveError(f"event type must be CamelCase, got {event_type!r}")
         if not _AUDIENCE_RE.match(audience):
@@ -202,13 +237,14 @@ class Store:
     """SQLite-backed event store. Single writer."""
 
     def __init__(self, path: str = ":memory:", *, projections: Iterable[Projection] = (),
-                 clock: Callable[[], str] = _utc_now):
+                 clock: Callable[[], str] = _utc_now, random_source: random.Random | None = None):
         self._connection = sqlite3.connect(path, isolation_level=None)
         self._connection.execute("PRAGMA foreign_keys = ON")
         if path != ":memory:":
             self._connection.execute("PRAGMA journal_mode = WAL")
         self._connection.executescript(SCHEMA)
         self._clock = clock
+        self._random_source = random_source if random_source is not None else random.Random()
         self._projections = list(projections)
         projection_names = [projection.name for projection in self._projections]
         if len(set(projection_names)) != len(projection_names) or not all(projection_names):
@@ -312,9 +348,84 @@ class Store:
                 audience=pending["audience"], subjects=tuple(pending["subjects"]),
                 world_time=pending["world_time"], prev_hash=previous_hash, hash=event_hash))
             previous_hash = event_hash
-        for stored_event in stored_events:
-            for projection in self._projections:
-                projection.apply(self._connection, stored_event)
+        if any(stored_event.type in (history.RETRACTED_EVENT_TYPE, history.RESTORED_EVENT_TYPE)
+               for stored_event in stored_events):
+            # History changed: statuses are re-derived and every projection is replayed from the log.
+            self._refresh_statuses(transaction.campaign_id)
+            self._replay()
+        else:
+            for stored_event in stored_events:
+                for projection in self._projections:
+                    projection.apply(self._connection, stored_event)
+
+    # -- undo, redo, roll voiding -------------------------------------------
+    def undo(self, campaign_id: str, target_sequence_number: int, *, actor_id: str, role: str,
+             cascade: bool = False, reason: str = "") -> int:
+        """Retract a transaction (and, for the DM with ``cascade``, everything that depends on it).
+        Returns the sequence number of the undo, which is what ``redo`` takes."""
+        with self.transaction(campaign_id, actor_id=actor_id, role=role, command="undo", arguments=dict(
+                target=target_sequence_number, cascade=cascade, reason=reason)) as transaction:
+            plan = history.plan_undo(self._connection, campaign_id, target_sequence_number,
+                                     actor_id=actor_id, role=role, cascade=cascade)
+            transaction._append_event(
+                history.RETRACTED_EVENT_TYPE,
+                dict(target_sequence_numbers=list(plan.target_sequence_numbers), reason=reason),
+                "public", (), None)
+            return transaction.sequence_number
+
+    def undo_last(self, campaign_id: str, *, actor_id: str, role: str, reason: str = "") -> int:
+        """Undo the most recent transaction this actor may undo (any, for the DM)."""
+        self._require_campaign(campaign_id)
+        target = history.latest_undoable_sequence_number(
+            self._connection, campaign_id, actor_id=actor_id, role=role)
+        return self.undo(campaign_id, target, actor_id=actor_id, role=role, reason=reason)
+
+    def redo(self, campaign_id: str, undo_sequence_number: int, *, actor_id: str, role: str) -> int:
+        """Reverse an earlier undo, restoring exactly the transactions it retracted."""
+        with self.transaction(campaign_id, actor_id=actor_id, role=role, command="redo", arguments=dict(
+                undo=undo_sequence_number)) as transaction:
+            plan = history.plan_redo(self._connection, campaign_id, undo_sequence_number,
+                                     actor_id=actor_id, role=role)
+            transaction._append_event(
+                history.RESTORED_EVENT_TYPE,
+                dict(undo_sequence_number=plan.undo_sequence_number,
+                     target_sequence_numbers=list(plan.restored_sequence_numbers)),
+                "public", (), None)
+            return transaction.sequence_number
+
+    def void_roll(self, campaign_id: str, roll_sequence_number: int, *, actor_id: str, role: str,
+                  reason: str) -> int:
+        """DM only: stop an undone roll from ever being reused (because the roll itself was the error)."""
+        if not reason:
+            raise HistoryRefused("voiding a roll needs a reason")
+        with self.transaction(campaign_id, actor_id=actor_id, role=role, command="void_roll", arguments=dict(
+                roll=roll_sequence_number, reason=reason)) as transaction:
+            history.plan_void_roll(self._connection, campaign_id, roll_sequence_number, role=role)
+            transaction._append_event(
+                history.ROLL_VOIDED_EVENT_TYPE, dict(roll_sequence_number=roll_sequence_number, reason=reason),
+                "dm", (), None)
+            return transaction.sequence_number
+
+    def _reusable_rolls(self, campaign_id: str, key: str, notation: str,
+                        excluded_sequence_numbers: frozenset[int]) -> list[tuple[int, dict]]:
+        return history.find_reusable_rolls(self._connection, campaign_id, key, notation,
+                                           excluded_sequence_numbers)
+
+    def _refresh_statuses(self, campaign_id: str) -> None:
+        retracted = history.retracted_sequence_numbers(self._connection, campaign_id)
+        self._connection.execute("UPDATE transactions SET status='active' WHERE campaign_id=?", (campaign_id,))
+        self._connection.executemany(
+            "UPDATE transactions SET status='retracted' WHERE campaign_id=? AND sequence_number=?",
+            [(campaign_id, sequence_number) for sequence_number in sorted(retracted)])
+
+    def verify_statuses(self, campaign_id: str) -> bool:
+        """True iff every transaction's cached status agrees with the fold over the undo/redo markers."""
+        self._require_campaign(campaign_id)
+        retracted = history.retracted_sequence_numbers(self._connection, campaign_id)
+        cached = {row[0] for row in self._connection.execute(
+            "SELECT sequence_number FROM transactions WHERE campaign_id=? AND status='retracted'",
+            (campaign_id,))}
+        return retracted == cached
 
     # -- reads --------------------------------------------------------------
     def events(self, campaign_id: str, *, include_retracted: bool = False) -> list[StoredEvent]:

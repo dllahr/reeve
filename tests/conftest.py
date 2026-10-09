@@ -1,4 +1,5 @@
 import itertools
+import random
 
 import pytest
 
@@ -39,7 +40,7 @@ def ticking_clock():
 
 @pytest.fixture
 def store(ticking_clock):
-    store = Store(":memory:", projections=[Ledger()], clock=ticking_clock)
+    store = Store(":memory:", projections=[Ledger()], clock=ticking_clock, random_source=random.Random(1234))
     store.create_campaign("c1", "toy")
     return store
 
@@ -48,3 +49,8 @@ def pay(store, campaign_id, payer, payee, amount, actor_id="dm1"):
     with store.transaction(campaign_id, actor_id=actor_id, role="dm", command="pay") as transaction:
         transaction.emit("CoinTransferred", {"from": payer, "to": payee, "amount": amount},
                          subjects=[payer, payee], world_time=0)
+
+
+def balances(store):
+    rows = store.connection.execute("SELECT holder, coin FROM p_balance")
+    return {holder: coin for holder, coin in rows}
