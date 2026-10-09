@@ -187,6 +187,26 @@ of `party.py move` and `combat.py round` refusing.
 - **Who may undo:** see §5.3. Anything a player undoes after the DM has *narrated on top of it* requires DM
   consent, because narration is an event with dependencies.
 
+### 7.1 As built (step 2)
+
+- Undo/redo are recorded as **bookkeeping transactions** whose events are `TransactionsRetracted` /
+  `TransactionsRestored`. These and `RollMade` / `RollVoided` are **reserved**: only the core can emit them.
+- Whether a transaction is retracted is a *fold* over the markers (`history.retracted_sequence_numbers`);
+  the `status` column is a cache, and `Store.verify_statuses` checks the two agree.
+- `undo(target)` returns the undo's own sequence number; `redo(undo_sequence_number)` reverses exactly that undo
+  (so a cascaded undo is redone as a group). Bookkeeping transactions cannot themselves be undone.
+- **Dependency** = a later active transaction sharing a `subject` with an earlier one, followed forward. Redo is
+  refused if any later active transaction touches the restored subjects. Emitters therefore have to list the
+  entities an event concerns in `subjects`; that is part of the emitting contract.
+- **Rolls are events**, with no separate table. A roll is *reusable* when it sits in a retracted transaction, no
+  other roll has ever reused it, and it has not been voided. Matching is by `key` and canonical dice notation.
+  Redo is refused if a roll it would restore has since been reused or voided.
+- Players undo only their own transactions and cannot cascade; the DM can do both; only the DM can void a roll.
+  Full role enforcement at the API remains step 3.
+- Known limitation: undo/redo replay every projection from the log. Fine now; projections can grow an
+  incremental `revert` later if it gets slow.
+- Refused undo/redo attempts roll back and leave no trace. Logging refusals (§6) is still to do.
+
 ## 8 · Rulesets (the multi-system seam)
 
 ```
@@ -288,8 +308,8 @@ POST /v1/admin/export | rebuild | import-legacy      admin credential only
 
 ## 13 · Build order (each step ends with passing tests)
 
-1. **Core skeleton:** event store, transactions, hash chain, projections, rebuild-equality test, deterministic export.
-2. **Roll registry + undo/redo** including the roll-key rules (§7) — before any game logic, because retrofitting
+1. ✅ **Core skeleton:** event store, transactions, hash chain, projections, rebuild-equality test, deterministic export.
+2. ✅ **Roll registry + undo/redo** including the roll-key rules (§7) — before any game logic, because retrofitting
    undo is the expensive mistake.
 3. **Visibility + auth + role shaping + process-separation harness.** Tests: a player token can never retrieve a
    `dm` event by any endpoint, including recall and export.

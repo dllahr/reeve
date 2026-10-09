@@ -3,7 +3,7 @@
 A tabletop-RPG referee server: event-sourced world state, role-based visibility
 (DM / player / observer), undo/redo, and pluggable rulesets (AD&D 1e first).
 
-Design and decisions: [DESIGN.md](DESIGN.md). Status: **build step 1 of 10 done** (core event store).
+Design and decisions: [DESIGN.md](DESIGN.md). Status: **build steps 1-2 of 10 done** (core event store; roll registry and undo/redo).
 
 ## Authorship
 
