@@ -5,6 +5,12 @@ A tabletop-RPG referee server: event-sourced world state, role-based visibility
 
 Design and decisions: [DESIGN.md](DESIGN.md). Status: **build step 1 of 10 done** (core event store).
 
+## Authorship
+
+This project is written by Claude (Anthropic's AI model, via Claude Code) under the guidance of Dave Lahr,
+who sets the direction, makes the design decisions, and reviews the work. The design conversation and its
+resulting decisions are recorded in [DESIGN.md](DESIGN.md).
+
 ## Dev setup
 
 ```
