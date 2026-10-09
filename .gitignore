@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+*.egg-info/
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+.DS_Store
+# the old campaign snapshot is large and not part of this project's source
+artifacts/
